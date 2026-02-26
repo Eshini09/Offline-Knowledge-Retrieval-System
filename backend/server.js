@@ -62,6 +62,12 @@ db.exec(`
   );
 `);
 
+// Add user profile columns if missing (SQLite lacks IF NOT EXISTS for columns)
+try { db.exec(`ALTER TABLE users ADD COLUMN name TEXT`); } catch {}
+try { db.exec(`ALTER TABLE users ADD COLUMN username TEXT`); } catch {}
+try { db.exec(`ALTER TABLE users ADD COLUMN role TEXT DEFAULT 'Viewer'`); } catch {}
+try { db.exec(`ALTER TABLE users ADD COLUMN status TEXT DEFAULT 'Active'`); } catch {}
+
 db.exec(`
   CREATE TABLE IF NOT EXISTS files (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -70,6 +76,33 @@ db.exec(`
     mime_type TEXT,
     size_bytes INTEGER,
     uploaded_at TEXT NOT NULL DEFAULT (datetime('now'))
+  );
+`);
+
+db.exec(`
+  CREATE TABLE IF NOT EXISTS doc_chunks (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    file_id INTEGER NOT NULL,
+    file_name TEXT NOT NULL,
+    location TEXT NOT NULL,
+    content TEXT NOT NULL,
+    embedding_json TEXT NOT NULL,
+    created_at TEXT NOT NULL DEFAULT (datetime('now'))
+  );
+`);
+
+db.exec(`
+  CREATE TABLE IF NOT EXISTS app_settings (
+    key TEXT PRIMARY KEY,
+    value TEXT NOT NULL
+  );
+`);
+
+db.exec(`
+  CREATE TABLE IF NOT EXISTS user_settings (
+    user_id INTEGER PRIMARY KEY,
+    display_name TEXT,
+    auto_scroll INTEGER NOT NULL DEFAULT 1
   );
 `);
 
@@ -85,6 +118,11 @@ function requireAuth(req, res, next) {
   } catch {
     return res.status(401).json({ error: "Invalid token" });
   }
+}
+
+function requireAdmin(req, res, next) {
+  if (req.user?.email !== "admin@company.com") return res.status(403).json({ error: "Admin only" });
+  return next();
 }
 
 // -------------------- Offline AI helpers (Ollama) --------------------
@@ -148,6 +186,17 @@ function cosineSim(a, b) {
   return dot / (Math.sqrt(na) * Math.sqrt(nb) + 1e-9);
 }
 
+function getSetting(key, fallback) {
+  const row = db.prepare("SELECT value FROM app_settings WHERE key = ?").get(key);
+  return row ? row.value : fallback;
+}
+
+function setSetting(key, value) {
+  db.prepare(
+    "INSERT INTO app_settings (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value"
+  ).run(key, String(value));
+}
+
 // -------------------- Session DB (temporary per user) --------------------
 function sessionDir(userId) {
   return path.resolve(`${sessionRoot}/${userId}`);
@@ -174,6 +223,18 @@ function extractPdfPages(pdfPath) {
   });
 }
 
+function looksLikePdf(filePath) {
+  try {
+    const fd = fs.openSync(filePath, "r");
+    const buf = Buffer.alloc(4);
+    fs.readSync(fd, buf, 0, 4, 0);
+    fs.closeSync(fd);
+    return buf.toString("utf8") === "%PDF";
+  } catch {
+    return false;
+  }
+}
+
 
 function ensureSessionDb(userId) {
   const dir = sessionDir(userId);
@@ -182,23 +243,24 @@ function ensureSessionDb(userId) {
   const sdb = new Database(sessionDbPath(userId));
 
   sdb.exec(`
-    CREATE TABLE IF NOT EXISTS chunks (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      file_name TEXT NOT NULL,
-      location TEXT NOT NULL,
-      content TEXT NOT NULL,
-      embedding_json TEXT NOT NULL
+    CREATE TABLE IF NOT EXISTS chat_sessions (
+      id TEXT PRIMARY KEY,
+      title TEXT NOT NULL,
+      created_at TEXT NOT NULL DEFAULT (datetime('now'))
     );
   `);
 
   sdb.exec(`
     CREATE TABLE IF NOT EXISTS messages (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
+      session_id TEXT,
       role TEXT NOT NULL,
       content TEXT NOT NULL,
       created_at TEXT NOT NULL DEFAULT (datetime('now'))
     );
   `);
+
+  try { sdb.exec(`ALTER TABLE messages ADD COLUMN session_id TEXT`); } catch {}
 
   return sdb;
 }
@@ -209,7 +271,9 @@ if (count === 0) {
   const email = "admin@company.com";
   const pass = "admin1234";
   const hash = bcrypt.hashSync(pass, 10);
-  db.prepare("INSERT INTO users (email, password_hash) VALUES (?, ?)").run(email, hash);
+  db.prepare(
+    "INSERT INTO users (email, password_hash, name, username, role, status) VALUES (?, ?, ?, ?, ?, ?)"
+  ).run(email, hash, "Admin", "admin", "Admin", "Active");
   console.log("Created default user:", email, "password:", pass);
 }
 
@@ -218,12 +282,23 @@ if (count === 0) {
 // Register (optional)
 app.post("/api/register", async (req, res) => {
   try {
-    const { email, password } = req.body || {};
+    let { email, password, name, username, role } = req.body || {};
+    if (!email && username) email = `${String(username).trim()}@local`;
+    const allowRegistrations = getSetting("allow_registrations", "true") === "true";
+    if (!allowRegistrations) {
+      return res.status(403).json({ error: "Registrations are disabled" });
+    }
     if (!email || !password || password.length < 6) {
       return res.status(400).json({ error: "Email and password (min 6 chars) required" });
     }
+    const safeName = name ? String(name).trim() : null;
+    const safeUsername = username ? String(username).trim() : null;
+    const defaultRole = getSetting("default_user_role", "Viewer");
+    const safeRole = role ? String(role).trim() : defaultRole;
     const password_hash = await bcrypt.hash(password, 10);
-    db.prepare("INSERT INTO users (email, password_hash) VALUES (?, ?)").run(email, password_hash);
+    db.prepare(
+      "INSERT INTO users (email, password_hash, name, username, role, status) VALUES (?, ?, ?, ?, ?, ?)"
+    ).run(email, password_hash, safeName, safeUsername, safeRole, "Active");
     return res.json({ ok: true });
   } catch (e) {
     if (String(e).includes("UNIQUE")) return res.status(409).json({ error: "User already exists" });
@@ -238,21 +313,122 @@ app.post("/api/login", async (req, res) => {
 
   const user = db.prepare("SELECT * FROM users WHERE email = ?").get(email);
   if (!user) return res.status(401).json({ error: "Invalid credentials" });
+  if (user.status && user.status !== "Active") return res.status(403).json({ error: "User is suspended" });
 
   const ok = await bcrypt.compare(password, user.password_hash);
   if (!ok) return res.status(401).json({ error: "Invalid credentials" });
 
   const token = jwt.sign({ sub: user.id, email: user.email }, JWT_SECRET, { expiresIn: "8h" });
-  return res.json({ token });
+  return res.json({ token, role: user.role });
 });
 
 // Me
 app.get("/api/me", requireAuth, (req, res) => {
-  res.json({ id: req.user.sub, email: req.user.email });
+  const user = db.prepare("SELECT id, email, name, username, role, status, created_at FROM users WHERE id = ?").get(req.user.sub);
+  res.json(user || { id: req.user.sub, email: req.user.email });
+});
+
+// Admin users management
+app.get("/api/users", requireAuth, requireAdmin, (req, res) => {
+  const rows = db
+    .prepare("SELECT id, name, username, email, role, status, created_at FROM users ORDER BY created_at DESC")
+    .all();
+  res.json({ users: rows });
+});
+
+app.patch("/api/users/:id", requireAuth, requireAdmin, (req, res) => {
+  const id = Number(req.params.id);
+  const { role, status, name } = req.body || {};
+  const user = db.prepare("SELECT id FROM users WHERE id = ?").get(id);
+  if (!user) return res.status(404).json({ error: "User not found" });
+
+  const nextRole = role ? String(role).trim() : null;
+  const nextStatus = status ? String(status).trim() : null;
+  const nextName = name ? String(name).trim() : null;
+
+  const current = db.prepare("SELECT role, status, name FROM users WHERE id = ?").get(id);
+  db.prepare("UPDATE users SET role = ?, status = ?, name = ? WHERE id = ?").run(
+    nextRole || current.role,
+    nextStatus || current.status,
+    nextName || current.name,
+    id
+  );
+  res.json({ ok: true });
+});
+
+app.delete("/api/users/:id", requireAuth, requireAdmin, (req, res) => {
+  const id = Number(req.params.id);
+  const user = db.prepare("SELECT id FROM users WHERE id = ?").get(id);
+  if (!user) return res.status(404).json({ error: "User not found" });
+  db.prepare("DELETE FROM users WHERE id = ?").run(id);
+  res.json({ ok: true });
+});
+
+app.post("/api/users", requireAuth, requireAdmin, async (req, res) => {
+  try {
+    let { email, password, name, username, role, status } = req.body || {};
+    if (!email && username) email = `${String(username).trim()}@local`;
+    if (!email || !password || String(password).length < 6) {
+      return res.status(400).json({ error: "Email and password (min 6 chars) required" });
+    }
+    const safeName = name ? String(name).trim() : null;
+    const safeUsername = username ? String(username).trim() : null;
+    const safeRole = role ? String(role).trim() : "Viewer";
+    const safeStatus = status ? String(status).trim() : "Active";
+    const password_hash = await bcrypt.hash(String(password), 10);
+    db.prepare(
+      "INSERT INTO users (email, password_hash, name, username, role, status) VALUES (?, ?, ?, ?, ?, ?)"
+    ).run(email, password_hash, safeName, safeUsername, safeRole, safeStatus);
+    const user = db
+      .prepare("SELECT id, name, username, email, role, status, created_at FROM users WHERE email = ?")
+      .get(email);
+    res.json({ user });
+  } catch (e) {
+    if (String(e).includes("UNIQUE")) return res.status(409).json({ error: "User already exists" });
+    return res.status(500).json({ error: "Server error" });
+  }
+});
+
+// App settings (admin)
+app.get("/api/settings", requireAuth, requireAdmin, (req, res) => {
+  const settings = {
+    org_name: getSetting("org_name", "Enterprise Offline Knowledge System"),
+    default_user_role: getSetting("default_user_role", "Viewer"),
+    allow_registrations: getSetting("allow_registrations", "true") === "true",
+  };
+  res.json(settings);
+});
+
+app.put("/api/settings", requireAuth, requireAdmin, (req, res) => {
+  const { org_name, default_user_role, allow_registrations } = req.body || {};
+  if (org_name) setSetting("org_name", String(org_name).trim());
+  if (default_user_role) setSetting("default_user_role", String(default_user_role).trim());
+  if (allow_registrations !== undefined) setSetting("allow_registrations", String(Boolean(allow_registrations)));
+  res.json({ ok: true });
+});
+
+// User settings
+app.get("/api/user-settings", requireAuth, (req, res) => {
+  const row = db
+    .prepare("SELECT display_name, auto_scroll FROM user_settings WHERE user_id = ?")
+    .get(req.user.sub);
+  const displayName = row?.display_name || null;
+  const autoScroll = row ? row.auto_scroll === 1 : true;
+  res.json({ display_name: displayName, auto_scroll: autoScroll });
+});
+
+app.put("/api/user-settings", requireAuth, (req, res) => {
+  const { display_name, auto_scroll } = req.body || {};
+  const safeName = display_name ? String(display_name).trim() : null;
+  const autoScroll = auto_scroll === undefined ? 1 : auto_scroll ? 1 : 0;
+  db.prepare(
+    "INSERT INTO user_settings (user_id, display_name, auto_scroll) VALUES (?, ?, ?) ON CONFLICT(user_id) DO UPDATE SET display_name = excluded.display_name, auto_scroll = excluded.auto_scroll"
+  ).run(req.user.sub, safeName, autoScroll);
+  res.json({ ok: true });
 });
 
 // Upload + ingest (TXT + PDF)
-app.post("/api/upload", requireAuth, upload.array("files", 50), async (req, res) => {
+app.post("/api/upload", requireAuth, requireAdmin, upload.array("files", 50), async (req, res) => {
   try {
     const uploaded = req.files || [];
     const userId = req.user.sub;
@@ -262,10 +438,9 @@ app.post("/api/upload", requireAuth, upload.array("files", 50), async (req, res)
       VALUES (?, ?, ?, ?)
     `);
 
-    const sdb = ensureSessionDb(userId);
-    const insertChunk = sdb.prepare(`
-      INSERT INTO chunks (file_name, location, content, embedding_json)
-      VALUES (?, ?, ?, ?)
+    const insertChunk = db.prepare(`
+      INSERT INTO doc_chunks (file_id, file_name, location, content, embedding_json)
+      VALUES (?, ?, ?, ?, ?)
     `);
 
     const results = [];
@@ -275,13 +450,14 @@ app.post("/api/upload", requireAuth, upload.array("files", 50), async (req, res)
       const fileId = info.lastInsertRowid;
 
       // ---- PDF ingest (FIXED: moved inside loop) ----
+      const fullPath = path.join(uploadDir, f.filename);
+      const nameLower = f.originalname.toLowerCase();
       const isPdf =
         f.mimetype === "application/pdf" ||
-        f.originalname.toLowerCase().endsWith(".pdf");
+        nameLower.endsWith(".pdf") ||
+        looksLikePdf(fullPath);
 
       if (isPdf) {
-        const fullPath = path.join(uploadDir, f.filename);
-
         const pages = await extractPdfPages(fullPath);
         const nonEmpty = pages.filter(p => (p.text || "").trim().length > 0).length;
         console.log("PDF pages:", pages.length, "nonempty:", nonEmpty);
@@ -297,7 +473,7 @@ app.post("/api/upload", requireAuth, upload.array("files", 50), async (req, res)
             const content = chunks[i];
             const location = `Page ${p.page}`;
             const emb = await ollamaEmbed(content);
-            insertChunk.run(f.originalname, location, content, JSON.stringify(emb));
+            insertChunk.run(fileId, f.originalname, location, content, JSON.stringify(emb));
           }
         }
       }
@@ -305,10 +481,13 @@ app.post("/api/upload", requireAuth, upload.array("files", 50), async (req, res)
       // ---- TXT ingest (same as before) ----
       const isText =
         (f.mimetype && f.mimetype.startsWith("text/")) ||
-        f.originalname.toLowerCase().endsWith(".txt");
+        nameLower.endsWith(".txt") ||
+        nameLower.endsWith(".md") ||
+        nameLower.endsWith(".csv") ||
+        nameLower.endsWith(".log") ||
+        nameLower.endsWith(".json");
 
       if (isText) {
-        const fullPath = path.join(uploadDir, f.filename);
         const raw = fs.readFileSync(fullPath, "utf8");
         const chunks = chunkText(raw, 1200, 150);
 
@@ -316,7 +495,7 @@ app.post("/api/upload", requireAuth, upload.array("files", 50), async (req, res)
           const content = chunks[i];
           const location = `Chunk ${i + 1}`;
           const emb = await ollamaEmbed(content);
-          insertChunk.run(f.originalname, location, content, JSON.stringify(emb));
+          insertChunk.run(fileId, f.originalname, location, content, JSON.stringify(emb));
         }
       }
 
@@ -330,7 +509,7 @@ app.post("/api/upload", requireAuth, upload.array("files", 50), async (req, res)
 });
 
 // List uploaded file metadata
-app.get("/api/files", requireAuth, (req, res) => {
+app.get("/api/files", requireAuth, requireAdmin, (req, res) => {
   const rows = db.prepare("SELECT * FROM files ORDER BY uploaded_at DESC").all();
   res.json({ files: rows });
 });
@@ -341,10 +520,7 @@ app.post("/api/search", requireAuth, (req, res) => {
   if (!query || !query.trim()) return res.status(400).json({ error: "Query required" });
 
   const q = query.trim().toLowerCase();
-  const userId = req.user.sub;
-  const sdb = ensureSessionDb(userId);
-
-  const rows = sdb.prepare(`SELECT file_name, location, content FROM chunks`).all();
+  const rows = db.prepare(`SELECT file_name, location, content FROM doc_chunks`).all();
 
   const results = [];
   for (const r of rows) {
@@ -376,12 +552,9 @@ app.post("/api/ask", requireAuth, async (req, res) => {
     const { question, topK = 6 } = req.body || {};
     if (!question || !question.trim()) return res.status(400).json({ error: "Question required" });
 
-    const userId = req.user.sub;
-    const sdb = ensureSessionDb(userId);
-
-    const rows = sdb.prepare(`SELECT file_name, location, content, embedding_json FROM chunks`).all();
+    const rows = db.prepare(`SELECT file_name, location, content, embedding_json FROM doc_chunks`).all();
     if (rows.length === 0) {
-      return res.json({ answer: "No documents indexed in this session yet. Upload text files first.", citations: [] });
+      return res.json({ answer: "No content found, try something else.", citations: [] });
     }
 
     const qEmb = await ollamaEmbed(question.trim());
@@ -400,8 +573,8 @@ app.post("/api/ask", requireAuth, async (req, res) => {
 
     const prompt = `You are an offline company document assistant.
 Answer ONLY using the SOURCES below.
-If the answer is not in the sources, say: "Not found in the uploaded documents."
-Cite like: (FILE - LOCATION - SOURCE #)
+If the answer is not in the sources, say: "No content found, try something else."
+Do NOT include citations, source numbers, filenames, or locations in the answer. If you need to attribute, say: "According to the database," and continue.
 
 User question: ${question.trim()}
 
@@ -409,14 +582,16 @@ SOURCES:
 ${evidence}
 
 Return:
-1) Answer (short)
-2) Citations (bullet list)
+Answer only (short)
 `;
 
     const answer = await ollamaGenerate(prompt);
 
+    const sources = Array.from(new Set(scored.map((p) => p.file)));
+
     res.json({
       answer,
+      sources,
       citations: scored.map((p, i) => ({
         source: i + 1,
         file: p.file,
@@ -433,28 +608,40 @@ Return:
 // Conversation chat (multi-turn)
 app.post("/api/chat", requireAuth, async (req, res) => {
   try {
-    const { message, topK = 6 } = req.body || {};
+    const { message, topK = 6, sessionId } = req.body || {};
     if (!message || !message.trim()) return res.status(400).json({ error: "Message required" });
 
     const userId = req.user.sub;
     const sdb = ensureSessionDb(userId);
+    let activeSessionId = sessionId;
+    if (!activeSessionId) {
+      activeSessionId = `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+      sdb.prepare(`INSERT INTO chat_sessions (id, title) VALUES (?, ?)`).run(activeSessionId, "New chat");
+    }
 
     // save user message
-    sdb.prepare(`INSERT INTO messages (role, content) VALUES (?, ?)`).run("user", message.trim());
+    sdb.prepare(`INSERT INTO messages (session_id, role, content) VALUES (?, ?, ?)`).run(activeSessionId, "user", message.trim());
+
+    // update chat title if it's still default
+    const session = sdb.prepare(`SELECT id, title FROM chat_sessions WHERE id = ?`).get(activeSessionId);
+    if (session && session.title === "New chat") {
+      const nextTitle = message.trim().slice(0, 36) + (message.trim().length > 36 ? "..." : "");
+      sdb.prepare(`UPDATE chat_sessions SET title = ? WHERE id = ?`).run(nextTitle, activeSessionId);
+    }
 
     // load last 10 messages
     const historyRows = sdb
-      .prepare(`SELECT role, content FROM messages ORDER BY id DESC LIMIT 10`)
-      .all()
+      .prepare(`SELECT role, content FROM messages WHERE session_id = ? ORDER BY id DESC LIMIT 10`)
+      .all(activeSessionId)
       .reverse();
 
     const historyText = historyRows.map((m) => `${m.role.toUpperCase()}: ${m.content}`).join("\n");
 
-    const rows = sdb.prepare(`SELECT file_name, location, content, embedding_json FROM chunks`).all();
+    const rows = db.prepare(`SELECT file_name, location, content, embedding_json FROM doc_chunks`).all();
     if (rows.length === 0) {
-      const reply = "No documents indexed in this session yet. Upload text files first.";
-      sdb.prepare(`INSERT INTO messages (role, content) VALUES (?, ?)`).run("assistant", reply);
-      return res.json({ reply, citations: [] });
+      const reply = "No content found, try something else.";
+      sdb.prepare(`INSERT INTO messages (session_id, role, content) VALUES (?, ?, ?)`).run(activeSessionId, "assistant", reply);
+      return res.json({ reply, citations: [], sources: [], sessionId: activeSessionId });
     }
 
     const qEmb = await ollamaEmbed(message.trim());
@@ -474,9 +661,9 @@ app.post("/api/chat", requireAuth, async (req, res) => {
     const prompt = `You are an offline company document assistant in a conversation.
 Rules:
 - Answer ONLY using the SOURCES.
-- If not found, say: "Not found in the uploaded documents."
+- If not found, say: "No content found, try something else."
 - Keep it short and clear.
-- Cite like: (FILE - LOCATION - SOURCE #)
+- Do NOT include citations, source numbers, filenames, or locations in the answer. If you need to attribute, say: "According to the database," and continue.
 
 CONVERSATION:
 ${historyText}
@@ -489,20 +676,70 @@ ASSISTANT:
 
     const reply = await ollamaGenerate(prompt);
 
-    sdb.prepare(`INSERT INTO messages (role, content) VALUES (?, ?)`).run("assistant", reply);
+    sdb.prepare(`INSERT INTO messages (session_id, role, content) VALUES (?, ?, ?)`).run(activeSessionId, "assistant", reply);
+
+    const sources = Array.from(new Set(scored.map((p) => p.file)));
 
     res.json({
       reply,
+      sources,
       citations: scored.map((p, i) => ({
         source: i + 1,
         file: p.file,
         location: p.location,
         snippet: p.content.slice(0, 240).replace(/\s+/g, " ") + (p.content.length > 240 ? "..." : ""),
       })),
+      sessionId: activeSessionId,
     });
   } catch (e) {
     res.status(500).json({ error: String(e.message || e) });
   }
+});
+
+// Chat sessions
+app.get("/api/chat/sessions", requireAuth, (req, res) => {
+  const sdb = ensureSessionDb(req.user.sub);
+  const sessions = sdb.prepare(`SELECT id, title, created_at FROM chat_sessions ORDER BY created_at DESC`).all();
+  res.json({ sessions });
+});
+
+app.post("/api/chat/sessions", requireAuth, (req, res) => {
+  const sdb = ensureSessionDb(req.user.sub);
+  const id = `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+  sdb.prepare(`INSERT INTO chat_sessions (id, title) VALUES (?, ?)`).run(id, "New chat");
+  const session = sdb.prepare(`SELECT id, title, created_at FROM chat_sessions WHERE id = ?`).get(id);
+  res.json({ session });
+});
+
+app.patch("/api/chat/sessions/:id", requireAuth, (req, res) => {
+  const sdb = ensureSessionDb(req.user.sub);
+  const { title } = req.body || {};
+  const safeTitle = String(title || "").trim();
+  if (!safeTitle) return res.status(400).json({ error: "Title required" });
+  const session = sdb.prepare(`SELECT id FROM chat_sessions WHERE id = ?`).get(req.params.id);
+  if (!session) return res.status(404).json({ error: "Session not found" });
+  sdb.prepare(`UPDATE chat_sessions SET title = ? WHERE id = ?`).run(safeTitle.slice(0, 80), req.params.id);
+  const updated = sdb.prepare(`SELECT id, title, created_at FROM chat_sessions WHERE id = ?`).get(req.params.id);
+  res.json({ session: updated });
+});
+
+app.get("/api/chat/sessions/:id/messages", requireAuth, (req, res) => {
+  const sdb = ensureSessionDb(req.user.sub);
+  const rows = sdb
+    .prepare(`SELECT role, content, created_at FROM messages WHERE session_id = ? ORDER BY id ASC`)
+    .all(req.params.id);
+  res.json({ messages: rows });
+});
+
+app.get("/api/chat/sessions/:id/export", requireAuth, (req, res) => {
+  const sdb = ensureSessionDb(req.user.sub);
+  const session = sdb.prepare(`SELECT id, title, created_at FROM chat_sessions WHERE id = ?`).get(req.params.id);
+  if (!session) return res.status(404).json({ error: "Session not found" });
+  const rows = sdb
+    .prepare(`SELECT role, content, created_at FROM messages WHERE session_id = ? ORDER BY id ASC`)
+    .all(req.params.id);
+  const text = rows.map((m) => `${m.role.toUpperCase()}: ${m.content}`).join("\n\n");
+  res.json({ session, messages: rows, text });
 });
 
 // Clear session (forget everything indexed for this user)

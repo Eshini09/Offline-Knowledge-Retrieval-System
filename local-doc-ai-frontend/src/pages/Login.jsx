@@ -1,6 +1,6 @@
 // src/pages/Login.jsx
 import React, { useMemo, useState } from "react";
-import { useNavigate } from "react-router-dom";
+import { Link, useNavigate } from "react-router-dom";
 import TextField from "../components/TextField.jsx";
 import Button from "../components/Button.jsx";
 
@@ -37,7 +37,26 @@ export default function Login() {
         }
 
         localStorage.setItem("auth_token", data.token);
-        nav("/app", { replace: true });
+
+        let homeRoute = "/chat";
+        if (data?.role === "Admin" || email.trim().toLowerCase() === "admin@company.com") {
+          homeRoute = "/app";
+          localStorage.setItem("home_route", homeRoute);
+          nav(homeRoute, { replace: true });
+          return;
+        }
+        try {
+          const meRes = await fetch("/api/me", {
+            headers: { Authorization: `Bearer ${data.token}` },
+          });
+          const me = await meRes.json().catch(() => ({}));
+          if (meRes.ok && me?.role === "Admin") homeRoute = "/app";
+        } catch (meErr) {
+          if (email.trim().toLowerCase() === "admin@company.com") homeRoute = "/app";
+        }
+
+        localStorage.setItem("home_route", homeRoute);
+        nav(homeRoute, { replace: true });
     } catch (err) {
         setError("Cannot reach the login server. Is the backend running on port 3001?");
     } finally {
@@ -89,6 +108,13 @@ export default function Login() {
 
               <div className="pt-2 text-xs text-zinc-500">
                 Backend: <span className="font-medium text-zinc-700">{API_BASE}</span>
+              </div>
+
+              <div className="text-sm text-zinc-600">
+                New here?{" "}
+                <Link to="/register" className="font-medium text-zinc-900 underline underline-offset-2">
+                  Create an account
+                </Link>
               </div>
             </form>
           </div>
