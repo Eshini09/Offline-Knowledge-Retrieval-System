@@ -2,6 +2,7 @@
 import React, { useEffect, useMemo, useRef, useState } from "react";
 import Button from "../components/Button.jsx";
 import AdminSidebar from "../components/AdminSidebar.jsx";
+import sortIcon from "../assets/sort.png";
 
 function formatBytes(bytes) {
   if (!bytes || bytes < 1) return "0 B";
@@ -25,14 +26,51 @@ function formatDate(value) {
   return new Date(value).toLocaleDateString();
 }
 
+function mapRowsToDocuments(rows) {
+  const grouped = new Map();
+
+  for (const row of rows || []) {
+    const key = row.original_name;
+    if (!grouped.has(key)) {
+      grouped.set(key, {
+        id: `db-${row.id}`,
+        fileId: row.id,
+        fileIds: [row.id],
+        name: row.original_name,
+        type: typeFromName(row.original_name),
+        date: row.uploaded_at,
+        size: row.size_bytes || 0,
+        status: "Indexed",
+      });
+      continue;
+    }
+
+    const current = grouped.get(key);
+    current.fileIds.push(row.id);
+  }
+
+  return Array.from(grouped.values());
+}
+
 export default function Dashboard() {
   const fileInputRef = useRef(null);
+  const typeMenuRef = useRef(null);
+  const dateMenuRef = useRef(null);
+  const sizeMenuRef = useRef(null);
 
   const [documents, setDocuments] = useState([]);
   const [searchQuery, setSearchQuery] = useState("");
   const [statusMsg, setStatusMsg] = useState("");
   const [errorMsg, setErrorMsg] = useState("");
   const [uploading, setUploading] = useState(false);
+  const [loadingDocuments, setLoadingDocuments] = useState(true);
+  const [selectedType, setSelectedType] = useState("all");
+  const [typeMenuOpen, setTypeMenuOpen] = useState(false);
+  const [dateMenuOpen, setDateMenuOpen] = useState(false);
+  const [dateSortOrder, setDateSortOrder] = useState("newest");
+  const [sizeMenuOpen, setSizeMenuOpen] = useState(false);
+  const [activeSortField, setActiveSortField] = useState("date");
+  const [sizeSortOrder, setSizeSortOrder] = useState("largest");
 
   function getTokenOrThrow() {
     const token = localStorage.getItem("auth_token");
@@ -57,6 +95,7 @@ export default function Dashboard() {
   }
 
   async function loadDocuments() {
+    setLoadingDocuments(true);
     setErrorMsg("");
     try {
       const token = getTokenOrThrow();
@@ -66,23 +105,52 @@ export default function Dashboard() {
       const data = await res.json().catch(() => ({}));
       if (!res.ok) throw new Error(data?.error || `Load failed (${res.status})`);
 
-      const mapped = (data?.files || []).map((row) => ({
-        id: `db-${row.id}`,
-        name: row.original_name,
-        type: typeFromName(row.original_name),
-        date: row.uploaded_at,
-        size: row.size_bytes || 0,
-        status: "Indexed",
-      }));
+      const mapped = mapRowsToDocuments(data?.files || []);
       setDocuments(mapped);
     } catch (err) {
       setErrorMsg(err?.message || "Failed to load documents");
+    } finally {
+      setLoadingDocuments(false);
     }
   }
 
   useEffect(() => {
     loadDocuments();
   }, []);
+
+  useEffect(() => {
+    function handleFocus() {
+      loadDocuments();
+    }
+
+    window.addEventListener("focus", handleFocus);
+    return () => window.removeEventListener("focus", handleFocus);
+  }, []);
+
+  useEffect(() => {
+    function handlePointerDown(event) {
+      const target = event.target;
+
+      if (typeMenuRef.current && !typeMenuRef.current.contains(target)) {
+        setTypeMenuOpen(false);
+      }
+      if (dateMenuRef.current && !dateMenuRef.current.contains(target)) {
+        setDateMenuOpen(false);
+      }
+      if (sizeMenuRef.current && !sizeMenuRef.current.contains(target)) {
+        setSizeMenuOpen(false);
+      }
+    }
+
+    document.addEventListener("mousedown", handlePointerDown);
+    return () => document.removeEventListener("mousedown", handlePointerDown);
+  }, []);
+
+  useEffect(() => {
+    if (!statusMsg) return undefined;
+    const timeoutId = window.setTimeout(() => setStatusMsg(""), 3000);
+    return () => window.clearTimeout(timeoutId);
+  }, [statusMsg]);
 
   async function onUploadSelected(fileList) {
     const files = Array.from(fileList || []);
@@ -91,32 +159,13 @@ export default function Dashboard() {
     setErrorMsg("");
     setStatusMsg("");
 
-    const now = Date.now();
-    const incomingDocs = files.map((file, idx) => ({
-      id: `${file.name}-${file.size}-${now}-${idx}`,
-      name: file.name,
-      type: typeFromName(file.name),
-      date: new Date().toISOString(),
-      size: file.size || 0,
-      status: "Indexing",
-    }));
-
-    setDocuments((prev) => {
-      const existing = new Set(prev.map((d) => `${d.name}::${d.size}`));
-      const unique = incomingDocs.filter((d) => !existing.has(`${d.name}::${d.size}`));
-      return [...unique, ...prev];
-    });
-
     try {
       setUploading(true);
       setStatusMsg("Uploading and indexing documents...");
       await uploadToBackend(files);
-      setDocuments((prev) => prev.map((d) => (incomingDocs.some((n) => n.id === d.id) ? { ...d, status: "Indexed" } : d)));
+      await loadDocuments();
       setStatusMsg("Upload complete.");
     } catch (err) {
-      setDocuments((prev) =>
-        prev.map((d) => (incomingDocs.some((n) => n.id === d.id) ? { ...d, status: "Upload failed" } : d)),
-      );
       setErrorMsg(err?.message || "Upload failed");
       setStatusMsg("");
     } finally {
@@ -124,17 +173,71 @@ export default function Dashboard() {
     }
   }
 
-  function onDeleteDocument(id) {
-    setDocuments((prev) => prev.filter((d) => d.id !== id));
+  async function onDeleteDocument(doc) {
+    const confirmed = window.confirm(`Delete "${doc.name}"? This will remove it from storage and the database.`);
+    if (!confirmed) return;
+
+    setStatusMsg("");
+    setErrorMsg("");
+    try {
+      const token = getTokenOrThrow();
+      const fileIds =
+        Array.isArray(doc.fileIds) && doc.fileIds.length > 0
+          ? doc.fileIds
+          : [
+              doc.fileId ??
+                (typeof doc.id === "string" && doc.id.startsWith("db-") ? Number(doc.id.slice(3)) : Number(doc.id)),
+            ];
+
+      for (const fileId of fileIds) {
+        if (!fileId || Number.isNaN(fileId)) continue;
+        const res = await fetch(`/api/files/${fileId}`, {
+          method: "DELETE",
+          headers: { Authorization: `Bearer ${token}` },
+        });
+        const data = await res.json().catch(() => ({}));
+        if (!res.ok) {
+          const isAlreadyGone = res.status === 404 && data?.error === "File not found";
+          if (!isAlreadyGone) throw new Error(data?.error || `Delete failed (${res.status})`);
+        }
+      }
+
+      await loadDocuments();
+      const successText = `Deleted "${doc.name}" successfully.`;
+      setStatusMsg(successText);
+    } catch (err) {
+      setErrorMsg(err?.message ? `Delete failed: ${err.message}` : "Delete failed.");
+    }
   }
 
-  function onEditDocument(id) {
-    setDocuments((prev) => prev.map((d) => (d.id === id ? { ...d, name: `${d.name} (edited)` } : d)));
-    setStatusMsg("Document label updated.");
-  }
+  async function onViewDocument(doc) {
+    setStatusMsg("");
+    setErrorMsg("");
+    try {
+      const token = getTokenOrThrow();
+      const resolvedFileId =
+        doc.fileId ??
+        (typeof doc.id === "string" && doc.id.startsWith("db-") ? Number(doc.id.slice(3)) : Number(doc.id));
 
-  function onViewDocument(doc) {
-    setStatusMsg(`Viewing "${doc.name}" is not wired yet.`);
+      if (!resolvedFileId || Number.isNaN(resolvedFileId)) {
+        throw new Error("Missing file id");
+      }
+
+      const res = await fetch(`/api/files/${resolvedFileId}/view`, {
+        headers: { Authorization: `Bearer ${token}` },
+      });
+      if (!res.ok) {
+        const data = await res.json().catch(() => ({}));
+        throw new Error(data?.error || `View failed (${res.status})`);
+      }
+
+      const blob = await res.blob();
+      const url = URL.createObjectURL(blob);
+      window.open(url, "_blank", "noopener,noreferrer");
+      setTimeout(() => URL.revokeObjectURL(url), 60_000);
+    } catch (err) {
+      setErrorMsg(err?.message || "View failed");
+    }
   }
 
   function onReindexDocument(id) {
@@ -147,14 +250,33 @@ export default function Dashboard() {
 
   const filteredDocuments = useMemo(() => {
     const q = searchQuery.trim().toLowerCase();
-    if (!q) return documents;
-    return documents.filter(
+    const filtered = !q
+      ? [...documents]
+      : documents.filter(
       (doc) =>
         doc.name.toLowerCase().includes(q) ||
         doc.type.toLowerCase().includes(q) ||
         doc.status.toLowerCase().includes(q),
     );
-  }, [documents, searchQuery]);
+
+    const typeFiltered =
+      selectedType === "all" ? filtered : filtered.filter((doc) => doc.type.toLowerCase() === selectedType.toLowerCase());
+
+    typeFiltered.sort((a, b) => {
+      if (activeSortField === "size") {
+        return sizeSortOrder === "smallest" ? a.size - b.size : b.size - a.size;
+      }
+      const aTime = new Date(a.date).getTime();
+      const bTime = new Date(b.date).getTime();
+      return dateSortOrder === "oldest" ? aTime - bTime : bTime - aTime;
+    });
+
+    return typeFiltered;
+  }, [documents, searchQuery, selectedType, dateSortOrder, activeSortField, sizeSortOrder]);
+
+  const documentTypes = useMemo(() => {
+    return Array.from(new Set(documents.map((doc) => doc.type).filter(Boolean))).sort((a, b) => a.localeCompare(b));
+  }, [documents]);
 
   return (
     <div className="min-h-screen w-full bg-zinc-100">
@@ -162,6 +284,12 @@ export default function Dashboard() {
         <AdminSidebar active="documents" />
 
         <main className="min-w-0 flex-1 bg-white p-4 md:h-screen md:overflow-auto md:p-6">
+          {statusMsg ? (
+            <div className="fixed right-4 top-4 z-20 rounded-xl border border-emerald-200 bg-emerald-50 px-4 py-3 text-sm text-emerald-700 shadow-lg">
+              {statusMsg}
+            </div>
+          ) : null}
+
           <div className="mb-4 flex flex-col gap-3 md:flex-row md:items-center md:justify-between">
             <div>
               <h1 className="text-xl font-semibold text-zinc-900">Documents</h1>
@@ -194,9 +322,6 @@ export default function Dashboard() {
             </Button>
           </div>
 
-          {statusMsg ? (
-            <div className="mb-3 rounded-xl border border-zinc-200 bg-zinc-50 px-4 py-2 text-sm text-zinc-700">{statusMsg}</div>
-          ) : null}
           {errorMsg ? (
             <div className="mb-3 rounded-xl border border-red-200 bg-red-50 px-4 py-2 text-sm text-red-700">{errorMsg}</div>
           ) : null}
@@ -206,15 +331,152 @@ export default function Dashboard() {
               <thead className="bg-zinc-50 text-left">
                 <tr>
                   <th className="border-b border-zinc-200 px-4 py-3 font-medium text-zinc-600">Name</th>
-                  <th className="border-b border-zinc-200 px-4 py-3 font-medium text-zinc-600">Type</th>
-                  <th className="border-b border-zinc-200 px-4 py-3 font-medium text-zinc-600">Date</th>
-                  <th className="border-b border-zinc-200 px-4 py-3 font-medium text-zinc-600">Size</th>
+                  <th className="border-b border-zinc-200 px-4 py-3 font-medium text-zinc-600">
+                    <div ref={typeMenuRef} className="relative inline-flex items-center gap-1">
+                      <span>Type</span>
+                      <button
+                        type="button"
+                        onClick={() => setTypeMenuOpen((open) => !open)}
+                        className="inline-flex h-5 w-5 items-center justify-center rounded text-xs text-zinc-500 hover:bg-zinc-200 hover:text-zinc-700"
+                        aria-label="Filter documents by type"
+                      >
+                        <img src={sortIcon} alt="" className="h-3.5 w-3.5" />
+                      </button>
+                      {typeMenuOpen ? (
+                        <div className="absolute left-0 top-full z-10 mt-2 min-w-36 rounded-xl border border-zinc-200 bg-white p-2 shadow-lg">
+                          <button
+                            type="button"
+                            onClick={() => {
+                              setSelectedType("all");
+                              setTypeMenuOpen(false);
+                            }}
+                            className={`block w-full rounded-lg px-3 py-2 text-left text-sm ${
+                              selectedType === "all" ? "bg-zinc-100 text-zinc-900" : "text-zinc-700 hover:bg-zinc-50"
+                            }`}
+                          >
+                            All types
+                          </button>
+                          {documentTypes.map((type) => (
+                            <button
+                              key={type}
+                              type="button"
+                              onClick={() => {
+                                setSelectedType(type);
+                                setTypeMenuOpen(false);
+                              }}
+                              className={`block w-full rounded-lg px-3 py-2 text-left text-sm ${
+                                selectedType === type ? "bg-zinc-100 text-zinc-900" : "text-zinc-700 hover:bg-zinc-50"
+                              }`}
+                            >
+                              {type}
+                            </button>
+                          ))}
+                        </div>
+                      ) : null}
+                    </div>
+                  </th>
+                  <th className="border-b border-zinc-200 px-4 py-3 font-medium text-zinc-600">
+                    <div ref={dateMenuRef} className="relative inline-flex items-center gap-1">
+                      <span>Date</span>
+                      <button
+                        type="button"
+                        onClick={() => setDateMenuOpen((open) => !open)}
+                        className="inline-flex h-5 w-5 items-center justify-center rounded text-xs text-zinc-500 hover:bg-zinc-200 hover:text-zinc-700"
+                        aria-label="Sort documents by upload date"
+                      >
+                        <img src={sortIcon} alt="" className="h-3.5 w-3.5" />
+                      </button>
+                      {dateMenuOpen ? (
+                        <div className="absolute left-0 top-full z-10 mt-2 min-w-40 rounded-xl border border-zinc-200 bg-white p-2 shadow-lg">
+                          <button
+                            type="button"
+                            onClick={() => {
+                              setActiveSortField("date");
+                              setDateSortOrder("newest");
+                              setDateMenuOpen(false);
+                            }}
+                            className={`block w-full rounded-lg px-3 py-2 text-left text-sm ${
+                              dateSortOrder === "newest" ? "bg-zinc-100 text-zinc-900" : "text-zinc-700 hover:bg-zinc-50"
+                            }`}
+                          >
+                            Newest first
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() => {
+                              setActiveSortField("date");
+                              setDateSortOrder("oldest");
+                              setDateMenuOpen(false);
+                            }}
+                            className={`block w-full rounded-lg px-3 py-2 text-left text-sm ${
+                              dateSortOrder === "oldest" ? "bg-zinc-100 text-zinc-900" : "text-zinc-700 hover:bg-zinc-50"
+                            }`}
+                          >
+                            Oldest first
+                          </button>
+                        </div>
+                      ) : null}
+                    </div>
+                  </th>
+                  <th className="border-b border-zinc-200 px-4 py-3 font-medium text-zinc-600">
+                    <div ref={sizeMenuRef} className="relative inline-flex items-center gap-1">
+                      <span>Size</span>
+                      <button
+                        type="button"
+                        onClick={() => setSizeMenuOpen((open) => !open)}
+                        className="inline-flex h-5 w-5 items-center justify-center rounded text-xs text-zinc-500 hover:bg-zinc-200 hover:text-zinc-700"
+                        aria-label="Sort documents by file size"
+                      >
+                        <img src={sortIcon} alt="" className="h-3.5 w-3.5" />
+                      </button>
+                      {sizeMenuOpen ? (
+                        <div className="absolute left-0 top-full z-10 mt-2 min-w-40 rounded-xl border border-zinc-200 bg-white p-2 shadow-lg">
+                          <button
+                            type="button"
+                            onClick={() => {
+                              setActiveSortField("size");
+                              setSizeSortOrder("largest");
+                              setSizeMenuOpen(false);
+                            }}
+                            className={`block w-full rounded-lg px-3 py-2 text-left text-sm ${
+                              activeSortField === "size" && sizeSortOrder === "largest"
+                                ? "bg-zinc-100 text-zinc-900"
+                                : "text-zinc-700 hover:bg-zinc-50"
+                            }`}
+                          >
+                            Largest first
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() => {
+                              setActiveSortField("size");
+                              setSizeSortOrder("smallest");
+                              setSizeMenuOpen(false);
+                            }}
+                            className={`block w-full rounded-lg px-3 py-2 text-left text-sm ${
+                              activeSortField === "size" && sizeSortOrder === "smallest"
+                                ? "bg-zinc-100 text-zinc-900"
+                                : "text-zinc-700 hover:bg-zinc-50"
+                            }`}
+                          >
+                            Smallest first
+                          </button>
+                        </div>
+                      ) : null}
+                    </div>
+                  </th>
                   <th className="border-b border-zinc-200 px-4 py-3 font-medium text-zinc-600">Status</th>
                   <th className="border-b border-zinc-200 px-4 py-3 font-medium text-zinc-600">Actions</th>
                 </tr>
               </thead>
               <tbody>
-                {filteredDocuments.length === 0 ? (
+                {loadingDocuments ? (
+                  <tr>
+                    <td className="px-4 py-8 text-center text-zinc-500" colSpan={6}>
+                      Loading documents...
+                    </td>
+                  </tr>
+                ) : filteredDocuments.length === 0 ? (
                   <tr>
                     <td className="px-4 py-8 text-center text-zinc-500" colSpan={6}>
                       No documents found.
@@ -251,14 +513,7 @@ export default function Dashboard() {
                           </button>
                           <button
                             type="button"
-                            onClick={() => onEditDocument(doc.id)}
-                            className="rounded-lg border border-zinc-200 px-2 py-1 text-xs text-zinc-700 hover:bg-zinc-100"
-                          >
-                            Edit
-                          </button>
-                          <button
-                            type="button"
-                            onClick={() => onDeleteDocument(doc.id)}
+                            onClick={() => onDeleteDocument(doc)}
                             className="rounded-lg border border-red-200 px-2 py-1 text-xs text-red-700 hover:bg-red-50"
                           >
                             Delete

@@ -280,13 +280,9 @@ function sessionDbPath(userId) {
   return path.resolve(`${sessionRoot}/${userId}/index.db`);
 }
 
-function extractPdfPages(pdfPath) {
+function runPdfExtractor(command, args) {
   return new Promise((resolve, reject) => {
-    if (!fs.existsSync(PDF_EXTRACT_SCRIPT)) {
-      return reject(new Error(`pdf_extract.py not found at: ${PDF_EXTRACT_SCRIPT}`));
-    }
-
-    execFile("python3", [PDF_EXTRACT_SCRIPT, pdfPath], { cwd: __dirname }, (err, stdout, stderr) => {
+    execFile(command, args, { cwd: __dirname }, (err, stdout, stderr) => {
       if (err) return reject(new Error(stderr || err.message));
       try {
         resolve(JSON.parse(stdout));
@@ -295,6 +291,40 @@ function extractPdfPages(pdfPath) {
       }
     });
   });
+}
+
+async function extractPdfPages(pdfPath) {
+  if (!fs.existsSync(PDF_EXTRACT_SCRIPT)) {
+    throw new Error(`pdf_extract.py not found at: ${PDF_EXTRACT_SCRIPT}`);
+  }
+
+  const configured = process.env.PYTHON_BIN ? [[process.env.PYTHON_BIN, [PDF_EXTRACT_SCRIPT, pdfPath]]] : [];
+  const candidates =
+    process.platform === "win32"
+      ? [
+          ...configured,
+          ["py", ["-3", PDF_EXTRACT_SCRIPT, pdfPath]],
+          ["python", [PDF_EXTRACT_SCRIPT, pdfPath]],
+          ["python3", [PDF_EXTRACT_SCRIPT, pdfPath]],
+        ]
+      : [
+          ...configured,
+          ["python3", [PDF_EXTRACT_SCRIPT, pdfPath]],
+          ["python", [PDF_EXTRACT_SCRIPT, pdfPath]],
+        ];
+
+  let lastError = null;
+  for (const [command, args] of candidates) {
+    try {
+      return await runPdfExtractor(command, args);
+    } catch (err) {
+      lastError = err;
+    }
+  }
+
+  throw new Error(
+    `PDF extraction failed. Install Python and required packages, or set PYTHON_BIN. Last error: ${lastError?.message || "unknown"}`
+  );
 }
 
 function looksLikePdf(filePath) {
@@ -355,11 +385,15 @@ if (count === 0) {
 db.prepare(
   `UPDATE users
    SET role = CASE
+     WHEN lower(email) = 'admin@company.com' THEN 'Admin'
      WHEN lower(role) = 'admin' THEN 'Admin'
      ELSE 'User'
    END
    WHERE role IS NOT NULL`
 ).run();
+
+// Ensure the built-in admin account always keeps admin privileges.
+db.prepare(`UPDATE users SET role = 'Admin' WHERE lower(email) = 'admin@company.com'`).run();
 
 // -------------------- Routes --------------------
 
@@ -595,6 +629,39 @@ app.post("/api/upload", requireAuth, requireAdmin, upload.array("files", 50), as
 app.get("/api/files", requireAuth, requireAdmin, (req, res) => {
   const rows = db.prepare("SELECT * FROM files ORDER BY uploaded_at DESC").all();
   res.json({ files: rows });
+});
+
+app.get("/api/files/:id/view", requireAuth, requireAdmin, (req, res) => {
+  const id = Number(req.params.id);
+  const row = db.prepare("SELECT * FROM files WHERE id = ?").get(id);
+  if (!row) return res.status(404).json({ error: "File not found" });
+
+  const fullPath = path.join(uploadDir, row.stored_name);
+  if (!fs.existsSync(fullPath)) return res.status(404).json({ error: "Stored file missing" });
+
+  if (row.mime_type) res.type(row.mime_type);
+  res.setHeader("Content-Disposition", `inline; filename="${encodeURIComponent(row.original_name)}"`);
+  return res.sendFile(fullPath);
+});
+
+app.delete("/api/files/:id", requireAuth, requireAdmin, (req, res) => {
+  const id = Number(req.params.id);
+  const row = db.prepare("SELECT * FROM files WHERE id = ?").get(id);
+  if (!row) return res.status(404).json({ error: "File not found" });
+
+  db.prepare("DELETE FROM doc_chunks WHERE file_id = ?").run(id);
+  db.prepare("DELETE FROM files WHERE id = ?").run(id);
+
+  const fullPath = path.join(uploadDir, row.stored_name);
+  if (fs.existsSync(fullPath)) {
+    try {
+      fs.unlinkSync(fullPath);
+    } catch (e) {
+      return res.status(500).json({ error: "Failed to delete stored file" });
+    }
+  }
+
+  return res.json({ ok: true });
 });
 
 // Exact word/phrase search (fast, offline)
