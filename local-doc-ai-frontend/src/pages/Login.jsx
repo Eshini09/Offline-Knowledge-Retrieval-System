@@ -4,6 +4,7 @@ import { Link, useNavigate } from "react-router-dom";
 import TextField from "../components/TextField.jsx";
 import Button from "../components/Button.jsx";
 import { apiFetch, cacheCurrentUser, clearClientSession } from "../lib/auth.js";
+import logoImage from "../assets/Logo.png";
 
 const API_BASE = "http://localhost:3001"; // your local backend
 
@@ -76,7 +77,7 @@ export default function Login() {
         <div className="w-full max-w-md">
           <div className="rounded-3xl border border-zinc-200 bg-white p-7 shadow-sm">
             <div className="flex items-center gap-3">
-              <div className="h-10 w-10 rounded-2xl bg-zinc-900" />
+              <img src={logoImage} alt="Logo" className="h-10 w-10 rounded-2xl object-cover" />
               <div>
                 <div className="text-lg font-semibold text-zinc-900">Sign in</div>
                 <div className="text-sm text-zinc-500">Local-only document search UI</div>
