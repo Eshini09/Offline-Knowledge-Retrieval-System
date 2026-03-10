@@ -4,4 +4,37 @@
 
 :root {
   color-scheme: light;
+  --brand-blue: #5a98ec;
+  --brand-ink: #24364f;
+  --brand-blue-soft: rgba(90, 152, 236, 0.16);
+}
+
+@layer components {
+  .brand-primary {
+    background: var(--brand-blue);
+    color: white;
+  }
+
+  .brand-primary:hover {
+    filter: brightness(0.96);
+  }
+
+  .brand-active {
+    background: var(--brand-blue);
+    color: white;
+    border-color: transparent;
+  }
+
+  .brand-focus {
+    transition: border-color 0.2s ease, box-shadow 0.2s ease;
+  }
+
+  .brand-focus:focus {
+    border-color: var(--brand-blue);
+    box-shadow: 0 0 0 4px var(--brand-blue-soft);
+  }
+
+  .brand-link {
+    color: var(--brand-blue);
+  }
 }

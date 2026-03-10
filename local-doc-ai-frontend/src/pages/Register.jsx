@@ -2,7 +2,7 @@ import React, { useMemo, useState } from "react";
 import { Link, useNavigate } from "react-router-dom";
 import TextField from "../components/TextField.jsx";
 import Button from "../components/Button.jsx";
-import logoImage from "../assets/Logo.png";
+import logoImage from "../assets/logo.png";
 
 function toBackendEmail(username) {
   const trimmed = username.trim();
@@ -76,7 +76,9 @@ export default function Register() {
         <div className="w-full max-w-md">
           <div className="rounded-3xl border border-zinc-200 bg-white p-7 shadow-sm">
             <div className="flex items-center gap-3">
-              <img src={logoImage} alt="Logo" className="h-10 w-10 rounded-2xl object-cover" />
+              <div className="h-16 w-16 overflow-hidden rounded-2xl">
+                <img src={logoImage} alt="Logo" className="h-full w-full object-cover" />
+              </div>
               <div>
                 <div className="text-lg font-semibold text-zinc-900">Create account</div>
                 <div className="text-sm text-zinc-500">Set up local access</div>
@@ -127,7 +129,7 @@ export default function Register() {
 
               <div className="text-sm text-zinc-600">
                 Already have an account?{" "}
-                <Link to="/login" className="font-medium text-zinc-900 underline underline-offset-2">
+                <Link to="/login" className="brand-link font-medium underline underline-offset-2">
                   Sign in
                 </Link>
               </div>

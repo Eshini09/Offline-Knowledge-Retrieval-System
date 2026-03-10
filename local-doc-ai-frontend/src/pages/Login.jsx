@@ -4,7 +4,7 @@ import { Link, useNavigate } from "react-router-dom";
 import TextField from "../components/TextField.jsx";
 import Button from "../components/Button.jsx";
 import { apiFetch, cacheCurrentUser, clearClientSession } from "../lib/auth.js";
-import logoImage from "../assets/Logo.png";
+import logoImage from "../assets/logo.png";
 
 const API_BASE = "http://localhost:3001"; // your local backend
 
@@ -77,10 +77,12 @@ export default function Login() {
         <div className="w-full max-w-md">
           <div className="rounded-3xl border border-zinc-200 bg-white p-7 shadow-sm">
             <div className="flex items-center gap-3">
-              <img src={logoImage} alt="Logo" className="h-10 w-10 rounded-2xl object-cover" />
+              <div className="h-16 w-16 overflow-hidden rounded-2xl">
+                <img src={logoImage} alt="Logo" className="h-full w-full object-cover" />
+              </div>
               <div>
-                <div className="text-lg font-semibold text-zinc-900">Sign in</div>
-                <div className="text-sm text-zinc-500">Local-only document search UI</div>
+                <div className="text-lg font-semibold text-zinc-900">Sign In</div>
+                <div className="text-sm text-zinc-500">Local Knowledge Retrieval System</div>
               </div>
             </div>
 
@@ -89,7 +91,7 @@ export default function Login() {
                 label="Email"
                 value={email}
                 onChange={setEmail}
-                placeholder="you@company.com"
+                placeholder="Enter your e-mail address"
                 autoComplete="email"
               />
 
@@ -118,7 +120,7 @@ export default function Login() {
 
               <div className="text-sm text-zinc-600">
                 New here?{" "}
-                <Link to="/register" className="font-medium text-zinc-900 underline underline-offset-2">
+                <Link to="/register" className="brand-link font-medium underline underline-offset-2">
                   Create an account
                 </Link>
               </div>

@@ -4,7 +4,7 @@ import Button from "./Button.jsx";
 import { logoutSession } from "../lib/auth.js";
 
 function navClass(active) {
-  if (active) return "block w-full rounded-xl bg-zinc-900 px-3 py-2 text-left text-sm font-medium text-white";
+  if (active) return "brand-active block w-full rounded-xl px-3 py-2 text-left text-sm font-medium";
   return "block w-full rounded-xl border border-zinc-200 px-3 py-2 text-left text-sm text-zinc-600 hover:bg-zinc-50";
 }
 

@@ -81,7 +81,7 @@ export default function SearchPanel({ files }) {
             className={[
               "rounded-xl px-3 py-2 text-xs font-medium border transition",
               mode === "exact"
-                ? "border-zinc-900 bg-zinc-900 text-white"
+                ? "brand-active"
                 : "border-zinc-200 bg-white text-zinc-900 hover:bg-zinc-50",
             ].join(" ")}
           >
@@ -93,7 +93,7 @@ export default function SearchPanel({ files }) {
             className={[
               "rounded-xl px-3 py-2 text-xs font-medium border transition",
               mode === "context"
-                ? "border-zinc-900 bg-zinc-900 text-white"
+                ? "brand-active"
                 : "border-zinc-200 bg-white text-zinc-900 hover:bg-zinc-50",
             ].join(" ")}
           >
@@ -104,7 +104,7 @@ export default function SearchPanel({ files }) {
 
       <div className="mt-4">
         <input
-          className="w-full rounded-xl border border-zinc-200 bg-white px-4 py-3 text-sm outline-none transition focus:border-zinc-400 focus:ring-4 focus:ring-zinc-100"
+          className="brand-focus w-full rounded-xl border border-zinc-200 bg-white px-4 py-3 text-sm outline-none"
           placeholder={mode === "exact" ? "Type a word or exact phrase..." : "Ask a question about the uploaded text..."}
           value={query}
           onChange={(e) => setQuery(e.target.value)}
